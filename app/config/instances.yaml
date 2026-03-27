@@ -1,0 +1,24 @@
+# XLDeploy instance registry
+# Each instance has: url, credentials, and allowed applicationIds
+
+instances:
+  xldeploy-p-30:
+    url: https://xldeploy-p-30.example.com
+    username: ${XLD_P30_USERNAME}
+    password: ${XLD_P30_PASSWORD}
+    verify_ssl: true
+
+  deploy-p-08:
+    url: https://deploy-p-08.example.com
+    username: ${XLD_P08_USERNAME}
+    password: ${XLD_P08_PASSWORD}
+    verify_ssl: true
+
+# Application-to-instance whitelist
+# Controls which instances each applicationId is allowed to access
+application_instances:
+  "131187451481":
+    - xldeploy-p-30
+  # "987654321":
+  #   - deploy-p-08
+  #   - xldeploy-p-30
