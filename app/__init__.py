@@ -2,9 +2,8 @@ import os
 import threading
 from typing import Any
 
+import connexion
 import yaml
-from flask import Flask
-from flask_smorest import Api
 
 from app.config.settings import config_by_name
 from app.utils.logging import setup_logging
@@ -21,36 +20,36 @@ def load_instances_config(path: str) -> dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def create_app(config_name: str | None = None) -> Flask:
-    """Flask application factory."""
+def create_app(config_name: str | None = None) -> connexion.FlaskApp:
+    """Application factory using connexion (API-first)."""
     if config_name is None:
         config_name = os.environ.get("FLASK_ENV", "development")
 
-    app = Flask(__name__)
-    app.config.from_object(config_by_name[config_name])
-
-    # Setup structured logging
-    setup_logging(app.config.get("LOG_LEVEL", "INFO"))
-
-    # Load XLD instances config
-    instances_config: dict[str, Any] = load_instances_config(app.config["INSTANCES_CONFIG"])
-    app.config["XLD_INSTANCES"] = instances_config.get("instances", {})
-    app.config["APPLICATION_INSTANCES"] = instances_config.get("application_instances", {})
-
-    # Initialize flask-smorest API (Swagger UI + OpenAPI)
-    api = Api(app)
-
-    # Define API key security scheme in OpenAPI spec
-    api.spec.components.security_scheme(
-        "ApiKeyAuth",
-        {"type": "apiKey", "in": "header", "name": "X-API-Key"},
+    # Create connexion app — spec_dir points to project root
+    spec_dir = os.path.dirname(os.path.dirname(__file__))
+    cxn_app = connexion.FlaskApp(
+        __name__,
+        specification_dir=spec_dir,
     )
 
-    # Register blueprints
-    from app.api.provisioning import provisioning_blp
-    from app.api.health import health_blp
+    # Load Flask config
+    flask_app = cxn_app.app
+    flask_app.config.from_object(
+        config_by_name[config_name]
+    )
 
-    api.register_blueprint(provisioning_blp, url_prefix="/api/v1")
-    api.register_blueprint(health_blp, url_prefix="/api/v1")
+    # Setup structured logging
+    setup_logging(flask_app.config.get("LOG_LEVEL", "INFO"))
 
-    return app
+    # Load XLD instances config
+    instances_config: dict[str, Any] = load_instances_config(flask_app.config["INSTANCES_CONFIG"])
+    flask_app.config["XLD_INSTANCES"] = instances_config.get("instances", {})
+    flask_app.config["APPLICATION_INSTANCES"] = instances_config.get("application_instances", {})
+
+    # Add API from OpenAPI spec — connexion handles routing, validation, Swagger UI
+    cxn_app.add_api(
+        "openapi_spec.yaml",
+        validate_responses=False,
+    )
+
+    return cxn_app

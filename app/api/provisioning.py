@@ -3,114 +3,146 @@ from datetime import datetime, timezone
 from typing import Any
 
 from flask import current_app
-from flask_smorest import Blueprint, abort
+from connexion import problem
 
 from app import processed_ids, processed_ids_lock
-from app.api.schemas import (
-    ProvisioningRequestSchema,
-    AckResponseSchema,
-    ErrorResponseSchema,
-)
-from app.utils.decorators import require_api_key
 from app.utils.logging import get_logger, log_with_context
 
-provisioning_blp = Blueprint(
-    "provisioning", __name__,
-    description="IAM provisioning operations (GRANT/REVOKE login access)",
-)
 logger = get_logger(__name__)
 
 
-@provisioning_blp.route("/provision", methods=["POST"])
-@provisioning_blp.doc(security=[{"ApiKeyAuth": []}])
-@require_api_key
-@provisioning_blp.arguments(ProvisioningRequestSchema)
-@provisioning_blp.response(202, AckResponseSchema, description="Request accepted for async processing")
-@provisioning_blp.alt_response(200, schema=AckResponseSchema, description="Duplicate request, already processed")
-@provisioning_blp.alt_response(400, schema=ErrorResponseSchema, description="Validation or config error")
-@provisioning_blp.alt_response(403, schema=ErrorResponseSchema, description="Application not authorized on instance")
-def provision(data: dict[str, Any]) -> dict[str, str] | tuple[dict[str, str], int]:
+def provision(
+    body: dict[str, Any],
+) -> tuple[dict, int]:
     """Submit a provisioning request (GRANT or REVOKE).
 
-    Receives a provisioning request from IAM, validates it, and acknowledges
-    immediately with HTTP 202. Processing happens asynchronously in a background
-    thread. A callback is sent to IAM when processing completes.
+    Connexion validates the request body against the
+    OpenAPI spec before calling this function.
     """
-    provisioning_id: str = data["provisioningId"]
-    task_id: str = data["taskId"]
+    provisioning_id: str = body["provisioningId"]
+    task_id: str = body["taskId"]
 
     # Idempotency check
     with processed_ids_lock:
         if provisioning_id in processed_ids:
             log_with_context(
-                logger, "WARNING", "Duplicate provisioningId, skipping",
+                logger, "WARNING",
+                "Duplicate provisioningId",
                 provisioningId=provisioning_id,
             )
+            now = datetime.now(timezone.utc)
             return {
                 "provisioningId": provisioning_id,
                 "taskId": task_id,
                 "status": "ALREADY_PROCESSED",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": now.isoformat(),
             }, 200
         processed_ids.add(provisioning_id)
 
     # Extract target instances from constraints
     instance_names: list[str] = []
-    for constraint in data["constraints"]:
-        if constraint["technicalName"] == "XLD_INSTANCE_NAME":
+    for constraint in body["constraints"]:
+        tech = constraint["technicalName"]
+        if tech == "XLD_INSTANCE_NAME":
             instance_names = constraint["values"]
             break
 
+    if not instance_names:
+        with processed_ids_lock:
+            processed_ids.discard(provisioning_id)
+        return problem(
+            status=400,
+            title="Bad Request",
+            detail="Missing XLD_INSTANCE_NAME constraint",
+        )
+
     # Validate instances exist in config
-    xld_instances: dict[str, Any] = current_app.config["XLD_INSTANCES"]
-    unknown: list[str] = [name for name in instance_names if name not in xld_instances]
+    xld_instances = current_app.config[
+        "XLD_INSTANCES"
+    ]
+    unknown = [
+        n for n in instance_names
+        if n not in xld_instances
+    ]
     if unknown:
         with processed_ids_lock:
             processed_ids.discard(provisioning_id)
-        abort(400, message=f"Unknown XLD instances: {unknown}")
+        return problem(
+            status=400,
+            title="Bad Request",
+            detail=(
+                "Unknown XLD instances: "
+                f"{unknown}"
+            ),
+        )
 
-    # Validate application is allowed on these instances
-    app_instances: dict[str, list[str]] = current_app.config["APPLICATION_INSTANCES"]
-    application_id: str = data["applicationId"]
-    allowed: list[str] = app_instances.get(application_id, [])
-    unauthorized: list[str] = [name for name in instance_names if name not in allowed]
+    # Validate app is allowed on these instances
+    app_instances = current_app.config[
+        "APPLICATION_INSTANCES"
+    ]
+    app_id: str = body["applicationId"]
+    allowed = app_instances.get(app_id, [])
+    unauthorized = [
+        n for n in instance_names
+        if n not in allowed
+    ]
     if unauthorized:
         with processed_ids_lock:
             processed_ids.discard(provisioning_id)
-        abort(403, message=f"Application {application_id} not authorized on: {unauthorized}")
+        return problem(
+            status=403,
+            title="Forbidden",
+            detail=(
+                f"Application {app_id} "
+                f"not authorized on: "
+                f"{unauthorized}"
+            ),
+        )
 
     log_with_context(
-        logger, "INFO", "Provisioning request accepted",
+        logger, "INFO",
+        "Provisioning request accepted",
         provisioningId=provisioning_id,
         taskId=task_id,
-        action=data["action"],
-        mail=data["mail"],
+        action=body["action"],
+        mail=body["mail"],
         instances=instance_names,
     )
 
     # Spawn background thread
+    cfg = current_app.config
     thread_config: dict[str, Any] = {
-        "xld_instances": {name: xld_instances[name] for name in instance_names},
-        "xld_login_role": current_app.config["XLD_LOGIN_ROLE"],
-        "xld_api_timeout": current_app.config["XLD_API_TIMEOUT"],
-        "iam_callback_url": current_app.config["IAM_CALLBACK_URL"],
-        "iam_callback_timeout": current_app.config["IAM_CALLBACK_TIMEOUT"],
-        "iam_callback_retries": current_app.config["IAM_CALLBACK_RETRIES"],
+        "xld_instances": {
+            n: xld_instances[n]
+            for n in instance_names
+        },
+        "xld_login_role": cfg["XLD_LOGIN_ROLE"],
+        "xld_api_timeout": cfg["XLD_API_TIMEOUT"],
+        "iam_callback_url": cfg["IAM_CALLBACK_URL"],
+        "iam_callback_timeout": cfg[
+            "IAM_CALLBACK_TIMEOUT"
+        ],
+        "iam_callback_retries": cfg[
+            "IAM_CALLBACK_RETRIES"
+        ],
     }
 
-    from app.services.provisioning_service import process_provisioning
+    from app.services.provisioning_service import (
+        process_provisioning,
+    )
 
     thread = threading.Thread(
         target=process_provisioning,
-        args=(data, instance_names, thread_config),
+        args=(body, instance_names, thread_config),
         daemon=True,
     )
     thread.start()
 
     # Return immediate ACK
+    now = datetime.now(timezone.utc)
     return {
         "provisioningId": provisioning_id,
         "taskId": task_id,
         "status": "ACKNOWLEDGED",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+        "timestamp": now.isoformat(),
+    }, 202

@@ -1,0 +1,255 @@
+openapi: 3.0.0
+info:
+  title: SGIAM Facade API
+  version: v1
+  description: >
+    Flask facade API that bridges the company's IAM system with Digital.ai Deploy
+    (XLDeploy) instances. Manages login access by adding/removing user emails
+    from the XLD_LOGIN role principals.
+
+servers:
+  - url: http://localhost:5000
+    description: Local development
+
+components:
+  schemas:
+    Constraint:
+      type: object
+      required:
+        - technicalName
+        - values
+      properties:
+        technicalName:
+          type: string
+          description: Constraint identifier (e.g. XLD_INSTANCE_NAME)
+          example: XLD_INSTANCE_NAME
+        values:
+          type: array
+          items:
+            type: string
+          description: List of values for this constraint
+          example: ["xldeploy-p-30", "deploy-p-08"]
+
+    ProvisioningRequest:
+      type: object
+      required:
+        - igg
+        - sesameId
+        - mail
+        - sgconnect
+        - namespaceId
+        - applicationId
+        - profileName
+        - action
+        - taskId
+        - provisioningId
+        - constraints
+      properties:
+        igg:
+          type: string
+          description: User IGG identifier
+          example: "13131313"
+        sesameId:
+          type: string
+          description: User Sesame ID
+          example: "SES123"
+        mail:
+          type: string
+          format: email
+          description: User email address (used as XLD principal)
+          example: "test@test.com"
+        sgconnect:
+          type: string
+          description: SG Connect identifier
+          example: "SGC456"
+        namespaceId:
+          type: string
+          description: IAM namespace identifier
+          example: "NS789"
+        applicationId:
+          type: string
+          description: Application identifier (must be whitelisted for target instances)
+          example: "131187451481"
+        profileName:
+          type: string
+          enum: ["XLD_LOGIN"]
+          description: IAM profile name (must be XLD_LOGIN)
+          example: "XLD_LOGIN"
+        action:
+          type: string
+          enum: ["GRANT", "REVOKE"]
+          description: Provisioning action
+          example: "GRANT"
+        taskId:
+          type: string
+          description: IAM task identifier (returned in ACK and callback)
+          example: "31HJG31KJ41"
+        provisioningId:
+          type: string
+          description: Unique provisioning request ID (used for idempotency)
+          example: "17863KJNKJJBF"
+        constraints:
+          type: array
+          items:
+            $ref: "#/components/schemas/Constraint"
+          description: >
+            Must contain at least one constraint with technicalName=XLD_INSTANCE_NAME
+            and non-empty values
+          minItems: 1
+
+    AckResponse:
+      type: object
+      required:
+        - provisioningId
+        - taskId
+        - status
+        - timestamp
+      properties:
+        provisioningId:
+          type: string
+          example: "17863KJNKJJBF"
+        taskId:
+          type: string
+          example: "31HJG31KJ41"
+        status:
+          type: string
+          enum: ["ACKNOWLEDGED", "ALREADY_PROCESSED"]
+          example: "ACKNOWLEDGED"
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-04-01T10:30:00+00:00"
+
+    CallbackPayload:
+      type: object
+      description: Payload sent by the facade API to IAM callback URL after processing
+      properties:
+        provisioningId:
+          type: string
+          example: "17863KJNKJJBF"
+        taskId:
+          type: string
+          example: "31HJG31KJ41"
+        status:
+          type: string
+          enum: ["SUCCESS", "PARTIAL_SUCCESS", "FAILURE"]
+          example: "SUCCESS"
+        timestamp:
+          type: string
+          format: date-time
+        details:
+          type: object
+          properties:
+            action:
+              type: string
+              enum: ["GRANT", "REVOKE"]
+            mail:
+              type: string
+              format: email
+            applicationId:
+              type: string
+            instancesProcessed:
+              type: array
+              items:
+                type: string
+              example: ["xldeploy-p-30"]
+            instancesFailed:
+              type: array
+              items:
+                type: string
+              example: []
+            errors:
+              type: object
+              nullable: true
+              additionalProperties:
+                type: string
+              description: Map of instance name to error message (null if no errors)
+
+    ErrorResponse:
+      type: object
+      properties:
+        detail:
+          type: string
+          example: "Unknown XLD instances: ['fake-instance']"
+        status:
+          type: integer
+          example: 400
+        title:
+          type: string
+          example: "Bad Request"
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          example: "healthy"
+
+paths:
+  /api/v1/health:
+    get:
+      tags:
+        - health
+      summary: Check API health status
+      operationId: app.api.health.health_check
+      responses:
+        "200":
+          description: API is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /api/v1/provision:
+    post:
+      tags:
+        - provisioning
+      summary: Submit a provisioning request (GRANT or REVOKE)
+      operationId: app.api.provisioning.provision
+      description: >
+        Receives a provisioning request from IAM, validates it, and acknowledges
+        immediately with HTTP 202. Processing happens asynchronously in a background
+        thread. A callback is sent to the IAM callback URL when processing completes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProvisioningRequest"
+      responses:
+        "202":
+          description: Request accepted for async processing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AckResponse"
+              example:
+                provisioningId: "17863KJNKJJBF"
+                taskId: "31HJG31KJ41"
+                status: "ACKNOWLEDGED"
+                timestamp: "2026-04-01T10:30:00+00:00"
+        "200":
+          description: Duplicate request — already processed (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AckResponse"
+              example:
+                provisioningId: "17863KJNKJJBF"
+                taskId: "31HJG31KJ41"
+                status: "ALREADY_PROCESSED"
+                timestamp: "2026-04-01T10:30:01+00:00"
+        "400":
+          description: Unknown XLD instance(s) or validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Application not authorized on requested instance(s)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
