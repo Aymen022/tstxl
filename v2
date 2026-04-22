@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""
+migrate_principals.py
+
+Migrates XLDeploy role principals from LDAP identities (AD groups or
+individual sAMAccountNames) to email addresses, resolved via the CDP API.
+Service accounts (userAccountType="generic") are kept as-is.
+
+For each principal:
+  - If it already contains '@' -> skip (already an email)
+  - Try /sam/{name} first (handles individual users + service accounts)
+      * userAccountType="generic" -> service account, keep as-is
+      * has userEmail -> replace with the email
+  - Fall back to /api/group/{name} for AD groups -> expand to member emails
+  - If neither resolves -> keep as-is (logged as warning)
+
+Usage:
+    python migrate_principals.py --instance URL                     # dry-run
+    python migrate_principals.py --instance URL --execute           # live
+    python migrate_principals.py --instance URL --rollback backup   # restore
+"""
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime
+
+import aiohttp
+import requests
+
+# ── Config ────────────────────────────────────────────────────────────────────
+BATCH_SIZE = 10
+CDP_RETRIES = 5
+XLD_RETRIES = 3
+BACKUP_DIR = "migration_backups"
+CDP_GROUP_URL = "https://cdp-users-api.fr.world.socgen/api/group"
+CDP_SAM_URL = "https://cdp-users-api.fr.world.socgen/sam"
+
+XLD_INSTANCES = [
+    "https://xldeploy-prd-16.fr.world.socgen:4516",
+    "https://xldeploy-prd-18.fr.world.socgen:4516",
+    "https://xldeploy-prd-29.fr.world.socgen:4516",
+    "https://xldeploy-prd-30.fr.world.socgen:4516",
+    "https://xldeploy-prd-01.fr.world.socgen:4516",
+    "https://deploy-prd-01.fr.world.socgen:4516",
+    "https://xldeploy-prd-04.fr.world.socgen:4516",
+    "https://xldeploy-prd-05.fr.world.socgen:4516",
+    "https://xldeploy-prd-07.fr.world.socgen:4516",
+    "https://xldeploy-prd-08.fr.world.socgen:4516",
+    "https://xldeploy-prd-86.fr.world.socgen:4516",
+    "https://xldeploy-prd-03.fr.world.socgen:4516",
+    "https://deploy-prd-03.fr.world.socgen:4516",
+    "https://deploy-prd-02.fr.world.socgen:4516",
+    "https://xldeploy-prd-14.fr.world.socgen:4516",
+    "https://xldeploy-prd-15.fr.world.socgen:4516",
+]
+
+USERNAME = os.getenv("XLD_ADMIN_USERNAME")
+PASSWORD = os.getenv("XLD_ADMIN_PASSWORD")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("migrate_principals")
+
+
+# ── XLD helpers ───────────────────────────────────────────────────────────────
+def xld_url(base_url, path):
+    return f"{base_url.rstrip('/')}/deployit/{path}"
+
+
+def fetch_role_principals(base_url):
+    """GET role principals from XLD, returns dict: role_name -> [principals]."""
+    resp = requests.get(
+        xld_url(base_url, "security/role/principals"),
+        auth=(USERNAME, PASSWORD),
+    )
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+    result = {}
+    for rp in root.findall(".//rolePrincipals"):
+        role = rp.find("role")
+        name = role.get("name") if role is not None else None
+        if name:
+            result[name] = [p.text for p in rp.findall("principals") if p.text]
+    return result
+
+
+def xld_request(method, base_url, role_name, principal):
+    """PUT or DELETE a principal on a role with retry + backoff."""
+    url = xld_url(base_url, f"security/role/{role_name}/{principal}")
+    for attempt in range(1, XLD_RETRIES + 1):
+        try:
+            resp = requests.request(method, url, auth=(USERNAME, PASSWORD))
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            log.warning(
+                "%s failed (attempt %d/%d) role=%s principal=%s: %s",
+                method, attempt, XLD_RETRIES, role_name, principal, e,
+            )
+            if attempt < XLD_RETRIES:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"{method} failed after {XLD_RETRIES} attempts: role={role_name} principal={principal}")
+
+
+# ── CDP resolution ────────────────────────────────────────────────────────────
+async def _fetch_json(session, url):
+    """GET a CDP URL with retries. Returns parsed JSON or None on 404/failure."""
+    for attempt in range(CDP_RETRIES):
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 404:
+                    return None
+                resp.raise_for_status()
+                return json.loads(await resp.text())
+        except Exception as e:
+            log.warning("CDP fetch '%s' (attempt %d/%d): %s", url, attempt + 1, CDP_RETRIES, e)
+            if attempt < CDP_RETRIES - 1:
+                await asyncio.sleep(5)
+    return None
+
+
+async def classify_principal(session, name):
+    """
+    Classify a single principal by querying CDP.
+
+    Returns one of:
+      ("email",   "alice@x.com")  -- individual user, replaced by email
+      ("service", name)            -- service account, kept as-is
+      ("group",   [emails])        -- AD group, expanded to member emails (may be empty)
+      ("unknown", None)            -- couldn't resolve, kept as-is
+    """
+    # Try /sam/ first (covers individual users + service accounts)
+    user = await _fetch_json(session, f"{CDP_SAM_URL}/{name}")
+    if user and isinstance(user, dict):
+        if user.get("userAccountType") == "generic":
+            return ("service", name)
+        email = user.get("userEmail")
+        if email:
+            return ("email", email.lower())
+
+    # Fall back to /api/group/ (AD group)
+    group = await _fetch_json(session, f"{CDP_GROUP_URL}/{name}")
+    if group and isinstance(group, dict) and "members" in group:
+        emails = [
+            m["userEmail"].lower()
+            for m in group.get("members", [])
+            if m.get("userEmail")
+        ]
+        return ("group", emails)
+
+    return ("unknown", None)
+
+
+async def resolve_principals(names):
+    """Resolve principals -> {name: (kind, value)}. Batched async."""
+    resolved = {}
+    names = list(names)
+
+    async with aiohttp.ClientSession() as session:
+        for i in range(0, len(names), BATCH_SIZE):
+            batch = names[i : i + BATCH_SIZE]
+            results = await asyncio.gather(*[classify_principal(session, n) for n in batch])
+            for name, (kind, value) in zip(batch, results):
+                resolved[name] = (kind, value)
+                if kind == "unknown":
+                    log.warning("Could not resolve principal: %s", name)
+                else:
+                    log.info("Resolved %s as %s", name, kind)
+    return resolved
+
+
+# ── Backup ────────────────────────────────────────────────────────────────────
+def save_json(data, prefix):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H_%M")
+    path = os.path.join(BACKUP_DIR, f"{prefix}_{ts}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+    log.info("Saved %s", path)
+    return path
+
+
+# ── Migration ─────────────────────────────────────────────────────────────────
+def apply_changes(base_url, roles, dry_run, direction="migrate"):
+    """
+    Apply migration or rollback on one instance.
+    direction="migrate": add new emails, remove old non-email principals (except kept ones)
+    direction="rollback": add back original non-email principals, remove the emails
+    """
+    added = removed = errors = 0
+
+    for role in roles:
+        role_name = role["role_name"]
+        non_email = role["non_email_principals"]
+        kept = role["kept_principals"]
+        new_emails = role["new_principals"]
+
+        if direction == "migrate":
+            to_add = new_emails
+            to_remove = [p for p in non_email if p not in kept]
+        else:
+            to_add = non_email
+            to_remove = new_emails
+
+        # Phase 1: ADD
+        add_ok = True
+        for principal in to_add:
+            if dry_run:
+                log.info("[DRY-RUN] ADD '%s' -> role '%s'", principal, role_name)
+                added += 1
+            else:
+                try:
+                    xld_request("PUT", base_url, role_name, principal)
+                    log.info("ADDED '%s' -> role '%s'", principal, role_name)
+                    added += 1
+                except Exception as e:
+                    add_ok = False
+                    errors += 1
+                    log.error("ADD failed: role=%s principal=%s: %s", role_name, principal, e)
+
+        # Phase 2: REMOVE (only if all adds succeeded)
+        if not add_ok:
+            log.warning("Skipping REMOVE for role '%s' due to ADD failures", role_name)
+            continue
+
+        for principal in to_remove:
+            if dry_run:
+                log.info("[DRY-RUN] REMOVE '%s' from role '%s'", principal, role_name)
+                removed += 1
+            else:
+                try:
+                    xld_request("DELETE", base_url, role_name, principal)
+                    log.info("REMOVED '%s' from role '%s'", principal, role_name)
+                    removed += 1
+                except Exception as e:
+                    errors += 1
+                    log.error("REMOVE failed: role=%s principal=%s: %s", role_name, principal, e)
+
+    return {"added": added, "removed": removed, "errors": errors, "roles": len(roles)}
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+async def run_migration(instance_url, dry_run=True, keep_empty_groups=False):
+    if not USERNAME or not PASSWORD:
+        log.error("Set XLD_ADMIN_USERNAME and XLD_ADMIN_PASSWORD env vars")
+        sys.exit(1)
+
+    # 1. Fetch role principals
+    log.info("Fetching role principals from %s ...", instance_url)
+    role_principals = fetch_role_principals(instance_url)
+    log.info("  %d roles, %d principals", len(role_principals), sum(len(v) for v in role_principals.values()))
+
+    # 2. Resolve all non-email principals via CDP
+    non_email_principals = {p for ps in role_principals.values() for p in ps if "@" not in p}
+    log.info("Resolving %d non-email principals via CDP ...", len(non_email_principals))
+    resolved = await resolve_principals(non_email_principals)
+
+    counts = {"email": 0, "service": 0, "group": 0, "unknown": 0}
+    for kind, _ in resolved.values():
+        counts[kind] += 1
+    log.info("  Users: %d, Service accts: %d, Groups: %d, Unresolved: %d",
+             counts["email"], counts["service"], counts["group"], counts["unknown"])
+
+    # 3. Build snapshot and backup
+    roles = []
+    for role_name, principals in role_principals.items():
+        non_email = [p for p in principals if "@" not in p]
+        kept = []           # Principals NOT to remove (service accounts, unresolved, optionally empty groups)
+        emails = set()      # Emails to add (deduplicated)
+
+        for p in non_email:
+            kind, value = resolved.get(p, ("unknown", None))
+            if kind == "email":
+                emails.add(value)
+            elif kind == "service":
+                kept.append(p)
+            elif kind == "group":
+                if value:
+                    emails.update(value)
+                elif keep_empty_groups:
+                    kept.append(p)
+            else:  # unknown
+                kept.append(p)
+
+        roles.append({
+            "role_name": role_name,
+            "original_principals": principals,
+            "non_email_principals": non_email,
+            "kept_principals": kept,
+            "new_principals": sorted(emails),
+        })
+
+    snapshot = {"instance_url": instance_url, "timestamp": datetime.now().isoformat(), "roles": roles}
+    backup_path = save_json([snapshot], "backup")
+
+    # 4. Apply
+    mode = "DRY-RUN" if dry_run else "EXECUTE"
+    log.info("Running migration (%s) ...", mode)
+    result = apply_changes(instance_url, roles, dry_run, direction="migrate")
+
+    save_json(result, f"report_{'dryrun' if dry_run else 'migration'}")
+    log.info("Done: %d roles, %d added, %d removed, %d errors", result["roles"], result["added"], result["removed"], result["errors"])
+
+    if dry_run:
+        log.info("Dry run. Review backup at %s, then re-run with --execute.", backup_path)
+
+
+async def run_rollback(backup_path, instance_url):
+    if not USERNAME or not PASSWORD:
+        log.error("Set XLD_ADMIN_USERNAME and XLD_ADMIN_PASSWORD env vars")
+        sys.exit(1)
+
+    with open(backup_path, "r") as f:
+        snapshots = json.load(f)
+
+    matching = [s for s in snapshots if s["instance_url"] == instance_url]
+    if not matching:
+        log.error("Instance %s not in backup. Found: %s", instance_url, [s["instance_url"] for s in snapshots])
+        sys.exit(1)
+
+    log.info("Rolling back %s ...", instance_url)
+    result = apply_changes(instance_url, matching[0]["roles"], dry_run=False, direction="rollback")
+
+    save_json(result, "report_rollback")
+    log.info("Rollback done: %d roles, %d added, %d removed, %d errors", result["roles"], result["added"], result["removed"], result["errors"])
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Migrate XLD principals: LDAP -> emails (one instance at a time)")
+    parser.add_argument("--instance", metavar="URL", help="XLD instance URL (required for migrate/rollback)")
+    parser.add_argument("--execute", action="store_true", help="Apply changes (default is dry-run)")
+    parser.add_argument("--rollback", metavar="BACKUP_FILE", help="Rollback from backup file")
+    parser.add_argument("--keep-empty-groups", action="store_true", help="Keep AD groups with no members")
+    args = parser.parse_args()
+
+    if not args.instance:
+        log.error("--instance URL is required.")
+        sys.exit(1)
+
+    if args.rollback:
+        asyncio.run(run_rollback(args.rollback, args.instance))
+    else:
+        asyncio.run(run_migration(args.instance, dry_run=not args.execute, keep_empty_groups=args.keep_empty_groups))
