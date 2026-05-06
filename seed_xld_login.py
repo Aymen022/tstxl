@@ -2,12 +2,11 @@
 """
 seed_xld_login.py
 
-1. Fetches all users from an XLDeploy instance via /deployit/security/user/list
-2. Resolves each via CDP /sam/{username} to get userEmail + userGgi
-3. Adds the emails to the XLD_LOGIN role
-4. Exports a CSV of active users in IAM provisioning format
-
-Service accounts (userAccountType="generic") and unresolvable users are skipped.
+Fetches all users from an XLDeploy instance via /deployit/security/user/list,
+collects their emails (resolving sAMAccountNames via CDP /api/sam/ when needed),
+and adds them to the XLD_LOGIN role. Service accounts (userAccountType="generic")
+are also added — using their sAMAccountName as the principal, since they have
+no email. Only fully-unresolved users are skipped.
 
 Usage:
     python seed_xld_login.py --instance URL                    # dry-run
@@ -17,14 +16,12 @@ Usage:
 
 import argparse
 import asyncio
-import csv
 import json
 import logging
 import os
 import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from urllib.parse import urlparse
 
 import aiohttp
 import requests
@@ -37,15 +34,7 @@ XLD_RETRIES = 3
 BACKUP_DIR = "login_seed_backups"
 DEFAULT_ROLE = "XLD_LOGIN"
 
-CDP_SAM_URL = "https://cdp-users-api.fr.world.socgen/sam"
-
-# IAM CSV defaults
-CSV_HEADER = [
-    "IGG", "SGCONNECT_LOGIN", "RESOURCE_NAME", "PROFILE_TECHNICAL_NAME",
-    "NEEDPROVISIONING", "NEEDNOTIFY", "XLD_INSTANCES",
-]
-CSV_RESOURCE_NAME = "xld"
-CSV_PROFILE = "XLDEPLOY_USER"
+CDP_SAM_URL = "https://cdp-users-api.fr.world.socgen/api/sam"
 
 USERNAME = os.getenv("XLD_ADMIN_USERNAME")
 PASSWORD = os.getenv("XLD_ADMIN_PASSWORD")
@@ -70,6 +59,7 @@ def fetch_users(base_url):
     root = ET.fromstring(resp.content)
 
     users = []
+    # Try a few common XML shapes; the User object may appear under different tags
     for user in root.iter():
         if user.tag.lower() not in ("user", "users") or user is root:
             continue
@@ -132,20 +122,37 @@ async def _fetch_sam(session, username):
     return None
 
 
-async def resolve_users(usernames):
-    """Resolve usernames -> {username: cdp_data_dict_or_None}. Batched async."""
+async def classify_user(session, username):
+    """
+    Returns one of:
+      ("email",   "alice@x.com")  -- has email
+      ("service", username)        -- service account, skip
+      ("unknown", None)            -- couldn't resolve
+    """
+    data = await _fetch_sam(session, username)
+    if data and isinstance(data, dict):
+        if data.get("userAccountType") == "generic":
+            return ("service", username)
+        email = data.get("userEmail")
+        if email:
+            return ("email", email.lower())
+    return ("unknown", None)
+
+
+async def resolve_usernames(usernames):
+    """Resolve usernames -> {username: (kind, value)}. Batched async."""
     resolved = {}
     usernames = list(usernames)
     async with aiohttp.ClientSession() as session:
         for i in range(0, len(usernames), CDP_BATCH):
             batch = usernames[i : i + CDP_BATCH]
-            results = await asyncio.gather(*[_fetch_sam(session, u) for u in batch])
-            for u, data in zip(batch, results):
-                resolved[u] = data
+            results = await asyncio.gather(*[classify_user(session, u) for u in batch])
+            for u, (kind, value) in zip(batch, results):
+                resolved[u] = (kind, value)
     return resolved
 
 
-# ── Output helpers ────────────────────────────────────────────────────────────
+# ── Backup ────────────────────────────────────────────────────────────────────
 def save_json(data, prefix):
     os.makedirs(BACKUP_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H_%M")
@@ -156,135 +163,83 @@ def save_json(data, prefix):
     return path
 
 
-def save_csv(rows, prefix, instance_label):
-    """Write IAM-format CSV with one row per active user."""
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H_%M")
-    path = os.path.join(BACKUP_DIR, f"{prefix}_{instance_label}_{ts}.csv")
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(CSV_HEADER)
-        for row in rows:
-            writer.writerow([
-                row["igg"],
-                row["email"],
-                CSV_RESOURCE_NAME,
-                CSV_PROFILE,
-                "TRUE",
-                "TRUE",
-                instance_label,
-            ])
-    log.info("Saved CSV %s (%d rows)", path, len(rows))
-    return path
-
-
-def short_instance_name(url):
-    """Derive a short label from the URL hostname (e.g. xldeploy-prd-16)."""
-    host = urlparse(url).hostname or url
-    return host.split(".")[0]
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def run(instance_url, target_role, dry_run):
     if not USERNAME or not PASSWORD:
         log.error("Set XLD_ADMIN_USERNAME and XLD_ADMIN_PASSWORD env vars")
         sys.exit(1)
 
-    instance_label = short_instance_name(instance_url)
-
     # 1. Fetch all users from XLD
     log.info("Fetching users from %s ...", instance_url)
-    xld_users = fetch_users(instance_url)
-    log.info("  Found %d users", len(xld_users))
+    users = fetch_users(instance_url)
+    log.info("  Found %d users", len(users))
 
-    # 2. Resolve every user via CDP (even those with email, to get userGgi)
-    usernames = [u["username"] for u in xld_users]
-    log.info("Resolving %d usernames via CDP /sam/ ...", len(usernames))
-    cdp_data = await resolve_users(usernames)
+    # 2. Split: users with email vs. users needing CDP lookup
+    principals = set()  # emails for users + sAMAccountNames for service accounts
+    to_resolve = []
+    for u in users:
+        if u["email"]:
+            principals.add(u["email"].lower())
+        else:
+            to_resolve.append(u["username"])
 
-    # 3. Build active user list
-    active = []          # CSV-eligible: has email + IGG, not service account
-    service_accts = []
-    unresolved = []
+    log.info("  %d users have email directly, %d need CDP /api/sam/ lookup",
+             len(principals), len(to_resolve))
 
-    for u in xld_users:
-        username = u["username"]
-        data = cdp_data.get(username)
+    # 3. Resolve sAMAccountNames via CDP
+    resolved = await resolve_usernames(to_resolve)
+    counts = {"email": 0, "service": 0, "unknown": 0}
+    for username, (kind, value) in resolved.items():
+        counts[kind] += 1
+        if kind == "email":
+            principals.add(value)
+        elif kind == "service":
+            principals.add(username)  # add the sAMAccountName as-is
 
-        if data is None:
-            # CDP didn't know the user; fall back to XLD email if any
-            if u["email"]:
-                active.append({"username": username, "email": u["email"].lower(), "igg": ""})
-            else:
-                unresolved.append(username)
-            continue
-
-        if data.get("userAccountType") == "generic":
-            service_accts.append(username)
-            continue
-
-        email = (data.get("userEmail") or u["email"] or "").lower()
-        igg = data.get("userGgi") or ""
-
-        if not email:
-            unresolved.append(username)
-            continue
-
-        active.append({"username": username, "email": email, "igg": igg})
-
-    # Dedup by email
-    seen = set()
-    deduped = []
-    for row in active:
-        if row["email"] in seen:
-            continue
-        seen.add(row["email"])
-        deduped.append(row)
-    active = deduped
-
-    log.info("  Active users with email: %d (CSV-eligible)", len(active))
-    log.info("  Service accounts skipped: %d", len(service_accts))
-    log.info("  Unresolved users skipped: %d", len(unresolved))
-
-    emails = {u["email"] for u in active}
+    log.info("  CDP results: users=%d, service accounts=%d, unresolved=%d",
+             counts["email"], counts["service"], counts["unknown"])
+    log.info("Total unique principals collected: %d (emails + service accounts)",
+             len(principals))
 
     # 4. Compute what's missing from target role
     log.info("Fetching current principals of role '%s' ...", target_role)
     current = set(fetch_role_principals(instance_url, target_role))
-    to_add = sorted(emails - current)
+    to_add = sorted(principals - current)
 
     log.info("Target role '%s' currently has %d principals", target_role, len(current))
-    log.info("Will add %d new emails (skipping %d already present)",
-             len(to_add), len(emails) - len(to_add))
+    log.info("Will add %d new principals (skipping %d already present)",
+             len(to_add), len(principals) - len(to_add))
 
-    # 5. Save backup + CSV
+    # 5. Save backup
     backup = {
         "instance_url": instance_url,
         "target_role": target_role,
         "timestamp": datetime.now().isoformat(),
         "current_principals": sorted(current),
-        "emails_to_add": to_add,
-        "all_active_users": active,
-        "skipped_service_accounts": sorted(service_accts),
-        "unresolved_usernames": sorted(unresolved),
+        "principals_to_add": to_add,
+        "all_collected_principals": sorted(principals),
+        "service_accounts_added": sorted(
+            u for u, (k, _) in resolved.items() if k == "service"
+        ),
+        "unresolved_usernames": sorted(
+            u for u, (k, _) in resolved.items() if k == "unknown"
+        ),
     }
     backup_path = save_json(backup, f"seed_{target_role}")
-    csv_path = save_csv(active, "iam_users", instance_label)
 
     if not to_add:
-        log.info("Nothing to add to XLD. Done.")
+        log.info("Nothing to add. Done.")
         return
 
     # 6. Apply
     mode = "DRY-RUN" if dry_run else "EXECUTE"
-    log.info("Adding emails to '%s' (%s, concurrency=%d) ...",
+    log.info("Adding principals to '%s' (%s, concurrency=%d) ...",
              target_role, mode, XLD_CONCURRENCY)
 
     if dry_run:
-        for email in to_add:
-            log.info("[DRY-RUN] ADD '%s' -> role '%s'", email, target_role)
-        log.info("Done (dry-run). Review backup at %s and CSV at %s, then re-run with --execute.",
-                 backup_path, csv_path)
+        for principal in to_add:
+            log.info("[DRY-RUN] ADD '%s' -> role '%s'", principal, target_role)
+        log.info("Done (dry-run). Review backup at %s, then re-run with --execute.", backup_path)
         return
 
     sem = asyncio.Semaphore(XLD_CONCURRENCY)
@@ -294,8 +249,8 @@ async def run(instance_url, target_role, dry_run):
     added = failed = 0
     async with aiohttp.ClientSession(auth=auth, connector=connector) as session:
         tasks = [
-            xld_add_principal(session, sem, instance_url, target_role, email)
-            for email in to_add
+            xld_add_principal(session, sem, instance_url, target_role, principal)
+            for principal in to_add
         ]
         for i, coro in enumerate(asyncio.as_completed(tasks), 1):
             ok = await coro
@@ -311,7 +266,7 @@ async def run(instance_url, target_role, dry_run):
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Seed XLD role + export IAM CSV from XLD user list")
+    parser = argparse.ArgumentParser(description="Seed an XLD role with all user emails (from XLD user list)")
     parser.add_argument("--instance", metavar="URL", required=True, help="XLD instance URL")
     parser.add_argument("--role", default=DEFAULT_ROLE, help=f"Target role (default: {DEFAULT_ROLE})")
     parser.add_argument("--execute", action="store_true", help="Apply changes (default is dry-run)")
